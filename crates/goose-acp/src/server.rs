@@ -373,6 +373,22 @@ fn summarize_tool_call(tool_name: &str, arguments: Option<&serde_json::Value>) -
     }
 }
 
+fn check_provider_configured(
+    config: &goose::config::Config,
+    metadata: &goose::providers::base::ProviderMetadata,
+) -> bool {
+    metadata.config_keys.iter().all(|k| {
+        if !k.required {
+            return true;
+        }
+        if k.secret {
+            config.get_secret::<String>(&k.name).is_ok()
+        } else {
+            config.get_param::<String>(&k.name).is_ok()
+        }
+    })
+}
+
 fn builtin_to_extension_config(name: &str) -> ExtensionConfig {
     if let Some(def) = PLATFORM_EXTENSIONS.get(name) {
         ExtensionConfig::Platform {
@@ -2321,6 +2337,47 @@ impl GooseAcpAgent {
         Ok(ListProvidersResponse {
             providers: list_provider_entries(None).await,
         })
+    }
+
+    #[custom_method(GetProviderDetailsRequest)]
+    async fn on_get_provider_details(
+        &self,
+        _req: GetProviderDetailsRequest,
+    ) -> Result<GetProviderDetailsResponse, sacp::Error> {
+        let config = self.load_config().ok();
+        let all = goose::providers::providers().await;
+        let entries = all
+            .into_iter()
+            .map(|(metadata, provider_type)| {
+                let is_configured = config
+                    .as_ref()
+                    .map(|c| check_provider_configured(c, &metadata))
+                    .unwrap_or(false);
+                ProviderDetailEntry {
+                    name: metadata.name.clone(),
+                    display_name: metadata.display_name.clone(),
+                    description: metadata.description.clone(),
+                    default_model: metadata.default_model.clone(),
+                    is_configured,
+                    provider_type: format!("{:?}", provider_type),
+                    config_keys: metadata
+                        .config_keys
+                        .iter()
+                        .map(|k| ProviderConfigKey {
+                            name: k.name.clone(),
+                            required: k.required,
+                            secret: k.secret,
+                            default: k.default.clone(),
+                            oauth_flow: k.oauth_flow,
+                            device_code_flow: k.device_code_flow,
+                            primary: k.primary,
+                        })
+                        .collect(),
+                    setup_steps: metadata.setup_steps.clone(),
+                }
+            })
+            .collect();
+        Ok(GetProviderDetailsResponse { providers: entries })
     }
 
     #[custom_method(ReadConfigRequest)]

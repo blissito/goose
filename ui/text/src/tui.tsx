@@ -19,6 +19,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import { ndJsonStream } from "@agentclientprotocol/sdk";
 import { GooseClient } from "@aaif/goose-acp";
+import Onboarding from "./onboarding.js";
 import { renderMarkdown } from "./markdown.js";
 import { renderToolCallLines } from "./toolcall.js";
 import type { ToolCallInfo } from "./toolcall.js";
@@ -32,7 +33,8 @@ interface PendingPermission {
 
 type ResponseItem =
   | (ContentChunk & { itemType: "content_chunk" })
-  | (ToolCall & { itemType: "tool_call" });
+  | (ToolCall & { itemType: "tool_call" })
+  | { itemType: "error"; message: string };
 
 interface Turn {
   userText: string;
@@ -42,6 +44,23 @@ interface Turn {
 
 function isErrorStatus(status: string): boolean {
   return status.startsWith("error") || status.startsWith("failed");
+}
+
+function formatError(e: unknown): string {
+  if (e instanceof Error) {
+    return e.message || e.toString();
+  }
+  if (typeof e === "string") {
+    return e;
+  }
+  if (e && typeof e === "object") {
+    try {
+      return JSON.stringify(e, null, 2);
+    } catch {
+      return String(e);
+    }
+  }
+  return String(e);
 }
 
 const GOOSE_FRAMES = [
@@ -465,6 +484,22 @@ function buildContentLines({
         ...renderToolCallLines(info, width, toolCallsExpanded, tcIdx === 0 && hasToolCalls),
       );
       tcIdx++;
+    } else if (item.itemType === "error") {
+      lines.push(emptyLine(`err-gap-${i}`, width));
+      lines.push(
+        <Box key={`err-box-${i}`} width={width} height={1}>
+          <Text color={CRANBERRY} bold>{"⚠ Error: "}</Text>
+        </Box>,
+      );
+      const errorLines = item.message.split("\n");
+      for (let j = 0; j < errorLines.length; j++) {
+        const line = errorLines[j]!;
+        lines.push(
+          <Box key={`err-${i}-${j}`} width={width} height={1}>
+            <Text color={CRANBERRY} wrap="wrap">{line}</Text>
+          </Box>,
+        );
+      }
     } else if (
       item.itemType === "content_chunk" &&
       item.content.type === "text" &&
@@ -650,6 +685,7 @@ function App({
   const [toolCallsExpanded, setToolCallsExpanded] = useState(false);
   const [scrollOffset, setScrollOffset] = useState(0);
   const [pastedFull, setPastedFull] = useState<string | null>(null);
+  const [needsOnboarding, setNeedsOnboarding] = useState(false);
 
   const clientRef = useRef<GooseClient | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -700,6 +736,16 @@ function App({
         newItems.push({ itemType: "content_chunk", content: { type: "text", text } });
       }
 
+      return [...prev.slice(0, -1), { ...last, responseItems: newItems }];
+    });
+  }, []);
+
+  const appendError = useCallback((errorMessage: string) => {
+    setTurns((prev) => {
+      if (prev.length === 0) return prev;
+      const last = { ...prev[prev.length - 1]! };
+      const newItems = [...last.responseItems];
+      newItems.push({ itemType: "error", message: errorMessage });
       return [...prev.slice(0, -1), { ...last, responseItems: newItems }];
     });
   }, []);
@@ -790,12 +836,14 @@ function App({
             : `stopped: ${result.stopReason}`,
         );
       } catch (e: unknown) {
-        setStatus(`error: ${e instanceof Error ? e.message : String(e)}`);
+        const errorMsg = formatError(e);
+        setStatus(`error`);
+        appendError(errorMsg);
       } finally {
         setLoading(false);
       }
     },
-    [appendAgent, addUserTurn],
+    [appendAgent, appendError, addUserTurn],
   );
 
   const processQueue = useCallback(async () => {
@@ -816,6 +864,36 @@ function App({
     },
     [executePrompt, processQueue],
   );
+
+  const createSession = useCallback(async (client: GooseClient) => {
+    setStatus("creating session…");
+    setLoading(true);
+    try {
+      const session = await client.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      sessionIdRef.current = session.sessionId;
+      setLoading(false);
+      setStatus("ready");
+
+      if (initialPrompt && !sentInitialPrompt.current) {
+        sentInitialPrompt.current = true;
+        await sendPrompt(initialPrompt);
+        setTimeout(() => exit(), 100);
+      }
+    } catch (e: unknown) {
+      const errorMsg = formatError(e);
+      setStatus(`failed: ${errorMsg}`);
+      setLoading(false);
+    }
+  }, [initialPrompt, sendPrompt, exit]);
+
+  const handleOnboardingComplete = useCallback(() => {
+    setNeedsOnboarding(false);
+    const client = clientRef.current;
+    if (client) createSession(client);
+  }, [createSession]);
 
   useEffect(() => {
     let cancelled = false;
@@ -870,32 +948,35 @@ function App({
         });
         if (cancelled) return;
 
-        setStatus("creating session…");
-        const session = await client.newSession({
-          cwd: process.cwd(),
-          mcpServers: [],
-        });
+        setStatus("checking provider…");
+        let hasProvider = false;
+        try {
+          const resp = await client.goose.GooseConfigRead({ key: "GOOSE_PROVIDER" });
+          hasProvider = resp.value != null && resp.value !== "" && resp.value !== "null";
+        } catch {
+          hasProvider = false;
+        }
         if (cancelled) return;
 
-        sessionIdRef.current = session.sessionId;
-        setLoading(false);
-        setStatus("ready");
-
-        if (initialPrompt && !sentInitialPrompt.current) {
-          sentInitialPrompt.current = true;
-          await sendPrompt(initialPrompt);
-          setTimeout(() => exit(), 100);
+        if (!hasProvider && !initialPrompt) {
+          setNeedsOnboarding(true);
+          setLoading(false);
+          setStatus("setup required");
+          return;
         }
+
+        await createSession(client);
       } catch (e: unknown) {
         if (cancelled) return;
-        setStatus(`failed: ${e instanceof Error ? e.message : String(e)}`);
+        const errorMsg = formatError(e);
+        setStatus(`failed: ${errorMsg}`);
         setLoading(false);
       }
     })();
 
     return () => { cancelled = true; };
   }, [
-    serverConnection, initialPrompt, sendPrompt,
+    serverConnection, initialPrompt, createSession,
     appendAgent, handleToolCall, handleToolCallUpdate, exit,
   ]);
 
@@ -991,7 +1072,7 @@ function App({
       });
       return;
     }
-  });
+  }, { isActive: !needsOnboarding });
 
   const PAD_X = 2;
   const PAD_Y = 1;
@@ -1030,6 +1111,23 @@ function App({
     toolCallsExpanded,
     queuedMessages: isLatest ? queuedMessages : [],
   });
+
+  if (needsOnboarding && clientRef.current) {
+    return (
+      <Box
+        flexDirection="column"
+        width={termWidth}
+        height={termHeight}
+      >
+        <Onboarding
+          client={clientRef.current}
+          width={termWidth}
+          height={termHeight}
+          onComplete={handleOnboardingComplete}
+        />
+      </Box>
+    );
+  }
 
   return (
     <Box
